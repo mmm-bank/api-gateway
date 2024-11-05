@@ -1,0 +1,209 @@
+version: "3.8"
+
+services:
+  nginx:
+    build: .
+    ports:
+      - "8080:8080"
+    networks:
+      - app-network
+    depends_on:
+      - auth-service
+      - card-manager-service
+      - transaction-service
+      - financial-analysis-service
+    volumes:
+      - ./nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf
+      - ./check_jwt.lua:/usr/local/check_jwt.lua
+
+  auth-service:
+    build: ../auth-service
+    ports:
+      - "8081:8080"
+    networks:
+      - app-network
+    depends_on:
+      - postgres-auth
+      - redis
+    environment:
+      POSTGRES_URL: "postgresql://user:password@postgres-auth:5432/user_db"
+      REDIS_ADDR: "redis:6379"
+      JWT_SECRET: "uCgKmX5P5EPfGpaE"
+
+  postgres-auth:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: user_db
+    ports:
+      - "5432:5432"
+    networks:
+      - app-network
+    volumes:
+      - ../auth-service/storage/init.sql:/docker-entrypoint-initdb.d/init.sql
+
+  redis:
+    image: redis:6
+    ports:
+      - "6379:6379"
+    networks:
+      - app-network
+
+  card-manager-service:
+    build: ../card-manager-service
+    ports:
+      - "8082:8080"
+    networks:
+      - app-network
+    depends_on:
+      - postgres-cards
+      - transaction-service
+    environment:
+      POSTGRES_URL: "postgresql://user:password@postgres-cards:5432/card_db"
+      AES_KEY: "S30VXRr3wKK62hX4"
+      TRANSACTION_SERVICE_URL: "http://transaction-service:8080"
+
+  postgres-cards:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: card_db
+    ports:
+      - "5433:5432"
+    networks:
+      - app-network
+    volumes:
+      - ../card-manager-service/storage/init.sql:/docker-entrypoint-initdb.d/init.sql
+
+  transaction-service:
+    build: ../transaction-service
+    ports:
+      - "8083:8080"
+    networks:
+      - app-network
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      postgres-accounts:
+        condition: service_started
+    environment:
+      RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672/"
+      POSTGRES_URL: "postgresql://user:password@postgres-accounts:5432/account_db"
+      AES_KEY: "S30VXRr3wKK62hX4"
+
+  postgres-accounts:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: account_db
+      POSTGRES_EXTENSIONS: pg_amqp
+    ports:
+      - "5434:5432"
+    networks:
+      - app-network
+    volumes:
+      - ../transaction-service/storage/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./pg_amqp/pg_amqp.so:/usr/lib/postgresql/16/lib/pg_amqp.so
+      - ./pg_amqp/amqp.control:/usr/share/postgresql/16/extension/amqp.control
+      - ./pg_amqp/sql/amqp--0.4.2.sql:/usr/share/postgresql/16/extension/amqp--0.4.2.sql
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    networks:
+      - app-network
+    healthcheck:
+      test: [ "CMD", "rabbitmq-diagnostics", "-q", "ping" ]
+      interval: 30s
+      timeout: 30s
+      retries: 3
+
+  financial-analysis-service:
+    build: ../financial-analysis-service
+    ports:
+      - "8084:8080"
+    networks:
+      - app-network
+    depends_on:
+      postgres-history:
+        condition: service_started
+    environment:
+      MONGO_URL: "mongodb://user:password@mongo-analysis:27017/financial_analysis?authSource=admin"
+      POSTGRES_URL: "postgresql://user:password@postgres-history:5432/history_db"
+
+  postgres-history:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: history_db
+    ports:
+      - "5435:5432"
+    networks:
+      - app-network
+    volumes:
+      - ../financial-analysis-service/storage/init.sql:/docker-entrypoint-initdb.d/init.sql
+
+  postgres-transaction-consumer:
+    build:
+      context: ../financial-analysis-service
+      dockerfile: transaction_consumer/postgres/Dockerfile
+    ports:
+      - "8085:8080"
+    networks:
+      - app-network
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      postgres-history:
+        condition: service_started
+    environment:
+      POSTGRES_URL: "postgresql://user:password@postgres-history:5432/history_db"
+      RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672/"
+      WORKER_POOL_SIZE: "5"
+
+  mongo-transaction-consumer:
+    build:
+      context: ../financial-analysis-service
+      dockerfile: transaction_consumer/mongo/Dockerfile
+    ports:
+      - "8086:8080"
+    networks:
+      - app-network
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      mongo-analysis:
+        condition: service_started
+    environment:
+      MONGO_URL: "mongodb://user:password@mongo-analysis:27017/financial_analysis?authSource=admin"
+      RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672/"
+      WORKER_POOL_SIZE: "5"
+
+  mongo-analysis:
+    image: mongo:6
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: user
+      MONGO_INITDB_ROOT_PASSWORD: password
+      MONGO_INITDB_DATABASE: financial_analysis
+    ports:
+      - "27017:27017"
+    networks:
+      - app-network
+    volumes:
+      - ../financial-analysis-service/transaction_consumer/mongo/init.js:/docker-entrypoint-initdb.d/init.js
+
+networks:
+  app-network:
+    driver: bridge
